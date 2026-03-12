@@ -1,97 +1,162 @@
 #!/usr/bin/env python3
+"""
+Retro digicam app for Raspberry Pi 4 (1GB RAM).
+
+Uses picamera2 dual-stream: lores for live preview, main for high-res capture.
+No mode switching = fast capture, low memory, no freezes.
+"""
+import os
+import sys
 import time
 import threading
 from pathlib import Path
 from datetime import datetime
 
+# SDL hints for RPi4 KMS/DRM - must be set before pygame import.
+os.environ.setdefault("SDL_VIDEODRIVER", "kmsdrm")
+os.environ.setdefault("SDL_VIDEO_EGL_DRIVER", "libEGL.so")
+
 import numpy as np
 import pygame
-from picamera2 import Picamera2
-from libcamera import controls
 from PIL import Image, ImageEnhance, ImageChops, ImageFilter
 
 # =========================
 # USER SETTINGS
 # =========================
 
-# Low-res live preview for speed + crunchy look.
-PREVIEW_SIZE = (320, 240)      # good "digicam LCD" vibe
-PREVIEW_FPS = 30               # lower if your display struggles
+# Live preview resolution (pulled from camera lores stream).
+PREVIEW_SIZE = (320, 240)
 
-# Saved photo resolution.
-# If this is too heavy on your Pi/display setup, reduce to (1920, 1080) or (1600, 1200).
-STILL_SIZE = (2304, 1296)
+# Target preview FPS. 24 is smooth enough and leaves CPU headroom on Pi4.
+PREVIEW_FPS = 24
 
-# JPEG quality lower = more compression artifacts.
+# Saved photo resolution (from camera main stream, always running).
+# 1920x1080 is a good balance of quality vs memory on 1GB Pi4.
+# For Camera Module 3 you can try (2304, 1296).
+STILL_SIZE = (1920, 1080)
+
+# JPEG quality: lower = more compression artifacts = more "digicam" feel.
 PHOTO_JPEG_QUALITY = 48
 
-# Touch shutter zone: top-right box as fractions of screen width/height.
-SHUTTER_ZONE = (0.72, 0.00, 0.28, 0.24)   # x, y, w, h in relative coordinates
+# Touch shutter zone: top-right box (x, y, w, h as fractions of screen).
+SHUTTER_ZONE = (0.72, 0.00, 0.28, 0.24)
 
-# Preview / photo orientation. Change if your display/camera is mounted rotated.
-PREVIEW_ROTATE = 0    # 0, 90, 180, 270
-PHOTO_ROTATE = 0      # 0, 90, 180, 270
+# Rotation for preview and saved photos (0, 90, 180, 270).
+PREVIEW_ROTATE = 0
+PHOTO_ROTATE = 0
 
-# Camera look.
+# Camera ISP look.
 DIGI_CONTRAST = 1.35
 DIGI_SATURATION = 1.12
 DIGI_SHARPNESS = 1.75
-DIGI_EXPOSURE_VALUE = -0.35    # slightly darker / harsher highlight rolloff
+DIGI_EXPOSURE_VALUE = -0.35
 
-# Saved-photo post-processing look.
-POST_DOWNSCALE = 0.78          # downscale then upscale a bit for old digicam feel
-POST_RED_SHIFT_PX = 1          # tiny chromatic misalignment
-POST_NOISE_STD = 5.0           # grain amount
-POST_BLUR_RADIUS = 0.2         # tiny softness after sharpening
+# Saved-photo post-processing.
+POST_DOWNSCALE = 0.78
+POST_RED_SHIFT_PX = 1
+POST_NOISE_STD = 5.0
+POST_BLUR_RADIUS = 0.2
 
-# Prevent double taps from firing twice immediately.
+# Debounce time between captures.
 CAPTURE_DEBOUNCE_SEC = 0.45
 
 # Where photos are saved.
 OUTPUT_DIR = Path.home() / "digicam_photos"
 
 # =========================
-# RESAMPLING COMPAT
+# PIL resampling compat
 # =========================
-
 try:
     RESAMPLE_BILINEAR = Image.Resampling.BILINEAR
 except AttributeError:
     RESAMPLE_BILINEAR = Image.BILINEAR
 
 
+def init_camera():
+    """Initialize picamera2 with dual-stream config.
+
+    Returns (picam2, camera_has_af) or exits with a helpful message.
+    """
+    try:
+        from picamera2 import Picamera2
+    except ImportError:
+        print("ERROR: picamera2 not found. Run: sudo apt install -y python3-picamera2")
+        sys.exit(1)
+
+    try:
+        picam2 = Picamera2()
+    except Exception as e:
+        print(f"ERROR: Cannot open camera: {e}")
+        print("Check that the camera cable is connected and 'libcamera-hello' works.")
+        sys.exit(1)
+
+    # Dual-stream config: main for stills, lores for preview.
+    # Both streams run simultaneously from the same ISP pipeline - no mode switch needed.
+    config = picam2.create_preview_configuration(
+        main={"size": STILL_SIZE, "format": "RGB888"},
+        lores={"size": PREVIEW_SIZE, "format": "RGB888"},
+        buffer_count=4,
+        queue=False,
+    )
+    picam2.configure(config)
+
+    # Now that camera is configured, we can read camera_controls safely.
+    camera_has_af = "LensPosition" in picam2.camera_controls
+
+    # Build runtime controls.
+    cam_controls = {
+        "Contrast": DIGI_CONTRAST,
+        "Saturation": DIGI_SATURATION,
+        "Sharpness": DIGI_SHARPNESS,
+        "ExposureValue": DIGI_EXPOSURE_VALUE,
+        "FrameDurationLimits": (int(1_000_000 / PREVIEW_FPS),
+                                int(1_000_000 / PREVIEW_FPS)),
+    }
+
+    if camera_has_af:
+        try:
+            from libcamera import controls as lc_controls
+            cam_controls["AfMode"] = lc_controls.AfModeEnum.Manual
+        except (ImportError, AttributeError):
+            # Older libcamera without AfModeEnum - use raw int value (0 = Manual).
+            cam_controls["AfMode"] = 0
+
+        lens_info = picam2.camera_controls.get("LensPosition")
+        if lens_info is not None and len(lens_info) >= 3:
+            cam_controls["LensPosition"] = lens_info[2]  # default position
+        else:
+            cam_controls["LensPosition"] = 0.8  # reasonable hyperfocal guess
+
+    picam2.start()
+    time.sleep(0.4)
+
+    # Apply controls after start so the ISP is running.
+    picam2.set_controls(cam_controls)
+    time.sleep(0.4)  # let AE/AWB settle
+
+    return picam2, camera_has_af
+
+
 class DigicamApp:
     def __init__(self):
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.picam2 = Picamera2()
+        self.picam2, self.camera_has_af = init_camera()
 
-        preview_controls = self._build_preview_controls()
-        still_controls = self._build_still_controls()
-
-        # Low-res preview config for speed.
-        self.preview_config = self.picam2.create_preview_configuration(
-            main={"size": PREVIEW_SIZE, "format": "RGB888"},
-            buffer_count=4,
-            queue=False,
-            controls=preview_controls,
-        )
-
-        # Higher-res still config for capture.
-        self.still_config = self.picam2.create_still_configuration(
-            main={"size": STILL_SIZE, "format": "RGB888"},
-            buffer_count=1,
-            controls=still_controls,
-        )
-
-        self.picam2.configure(self.preview_config)
-        self.picam2.start()
-        time.sleep(0.8)  # warm up AE/AWB a bit
-
+        # Initialize pygame.
         pygame.init()
         pygame.font.init()
 
-        self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        # Try fullscreen; fall back to a window if KMS/DRM isn't available.
+        try:
+            self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        except pygame.error:
+            # Fallback for X11 / Wayland / SSH-forwarded sessions.
+            os.environ["SDL_VIDEODRIVER"] = ""
+            pygame.display.quit()
+            pygame.display.init()
+            self.screen = pygame.display.set_mode((480, 320))
+
         pygame.display.set_caption("Pi Digicam")
         pygame.mouse.set_visible(False)
 
@@ -100,6 +165,13 @@ class DigicamApp:
         self.font = pygame.font.Font(None, 26)
         self.small_font = pygame.font.Font(None, 22)
 
+        # Pre-compute shutter zone rect once.
+        rx, ry, rw, rh = SHUTTER_ZONE
+        self.shutter_rect = pygame.Rect(
+            int(rx * self.screen_w), int(ry * self.screen_h),
+            int(rw * self.screen_w), int(rh * self.screen_h),
+        )
+
         self.running = True
         self.capture_busy = False
         self.last_capture_time = 0.0
@@ -107,164 +179,124 @@ class DigicamApp:
         self.status_text = "READY"
         self.status_until = 0.0
 
-    def _build_preview_controls(self):
-        frame_us = int(1_000_000 / PREVIEW_FPS)
-
-        controls_dict = {
-            "Contrast": DIGI_CONTRAST,
-            "Saturation": DIGI_SATURATION,
-            "Sharpness": DIGI_SHARPNESS,
-            "ExposureValue": DIGI_EXPOSURE_VALUE,
-            "FrameDurationLimits": (frame_us, frame_us),  # fixed preview FPS
-        }
-
-        # Camera Module 3 manual focus to default/hyperfocal-ish position if available.
-        lens_info = self.picam2.camera_controls.get("LensPosition", None)
-        if lens_info is not None and len(lens_info) >= 3:
-            controls_dict["AfMode"] = controls.AfModeEnum.Manual
-            controls_dict["LensPosition"] = lens_info[2]
-        elif lens_info is not None:
-            controls_dict["AfMode"] = controls.AfModeEnum.Manual
-            controls_dict["LensPosition"] = 0.8
-
-        return controls_dict
-
-    def _build_still_controls(self):
-        controls_dict = {
-            "Contrast": DIGI_CONTRAST,
-            "Saturation": DIGI_SATURATION,
-            "Sharpness": DIGI_SHARPNESS,
-            "ExposureValue": DIGI_EXPOSURE_VALUE,
-        }
-
-        lens_info = self.picam2.camera_controls.get("LensPosition", None)
-        if lens_info is not None and len(lens_info) >= 3:
-            controls_dict["AfMode"] = controls.AfModeEnum.Manual
-            controls_dict["LensPosition"] = lens_info[2]
-        elif lens_info is not None:
-            controls_dict["AfMode"] = controls.AfModeEnum.Manual
-            controls_dict["LensPosition"] = 0.8
-
-        return controls_dict
-
-    def _rel_rect(self, rel_rect):
-        rx, ry, rw, rh = rel_rect
-        return pygame.Rect(
-            int(rx * self.screen_w),
-            int(ry * self.screen_h),
-            int(rw * self.screen_w),
-            int(rh * self.screen_h),
+        # Pre-allocate overlay surfaces to avoid per-frame allocation.
+        self._shutter_overlay = pygame.Surface(
+            (self.shutter_rect.width, self.shutter_rect.height), pygame.SRCALPHA
         )
+        self._shutter_overlay.fill((255, 255, 255, 35))
 
-    def _point_in_shutter_zone(self, x, y):
-        return self._rel_rect(SHUTTER_ZONE).collidepoint(x, y)
+        self._status_bar = pygame.Surface((self.screen_w, 30), pygame.SRCALPHA)
+        self._status_bar.fill((0, 0, 0, 140))
+
+        self._flash_surface = pygame.Surface(
+            (self.screen_w, self.screen_h), pygame.SRCALPHA
+        )
+        self._flash_surface.fill((255, 255, 255, 130))
 
     def _set_status(self, text, seconds=2.0):
         self.status_text = text
         self.status_until = time.time() + seconds
 
     def _build_preview_surface(self, frame):
-        # frame is H x W x 3, pygame wants W x H x 3
+        """Convert camera lores frame (H,W,3) to a pygame surface."""
+        # np.transpose creates a contiguous copy - unavoidable for pygame's (W,H,3) layout.
         surface = pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2)))
         if PREVIEW_ROTATE:
             surface = pygame.transform.rotate(surface, PREVIEW_ROTATE)
         return surface
 
     def _blit_cover(self, surface):
-        sw, sh = self.screen.get_size()
+        """Scale and center-crop the preview to fill the screen."""
+        sw, sh = self.screen_w, self.screen_h
         iw, ih = surface.get_size()
-
         scale = max(sw / iw, sh / ih)
         new_w = int(iw * scale)
         new_h = int(ih * scale)
-
         scaled = pygame.transform.scale(surface, (new_w, new_h))
-        x = (sw - new_w) // 2
-        y = (sh - new_h) // 2
-        self.screen.blit(scaled, (x, y))
+        self.screen.blit(scaled, ((sw - new_w) // 2, (sh - new_h) // 2))
 
     def _draw_ui(self):
-        shutter_rect = self._rel_rect(SHUTTER_ZONE)
+        now = time.time()
 
-        # translucent shutter zone
-        overlay = pygame.Surface((shutter_rect.width, shutter_rect.height), pygame.SRCALPHA)
-        overlay.fill((255, 255, 255, 35))
-        self.screen.blit(overlay, shutter_rect.topleft)
+        # Shutter zone overlay (pre-allocated surface).
+        self.screen.blit(self._shutter_overlay, self.shutter_rect.topleft)
+        pygame.draw.rect(self.screen, (255, 255, 255), self.shutter_rect,
+                         width=2, border_radius=14)
 
-        pygame.draw.rect(self.screen, (255, 255, 255), shutter_rect, width=2, border_radius=14)
-
-        # simple shutter icon
-        cx, cy = shutter_rect.center
-        r_outer = max(12, min(shutter_rect.width, shutter_rect.height) // 6)
+        # Shutter icon.
+        cx, cy = self.shutter_rect.center
+        r_outer = max(12, min(self.shutter_rect.width, self.shutter_rect.height) // 6)
         r_inner = max(6, r_outer // 2)
         pygame.draw.circle(self.screen, (255, 255, 255), (cx, cy), r_outer, width=2)
         pygame.draw.circle(self.screen, (255, 255, 255), (cx, cy), r_inner, width=2)
 
         label = self.small_font.render("SHOT", True, (255, 255, 255))
-        self.screen.blit(label, (shutter_rect.x + 10, shutter_rect.y + 8))
+        self.screen.blit(label, (self.shutter_rect.x + 10, self.shutter_rect.y + 8))
 
-        # status bar
-        if time.time() < self.status_until or self.capture_busy:
-            bar_h = 30
-            bar = pygame.Surface((self.screen_w, bar_h), pygame.SRCALPHA)
-            bar.fill((0, 0, 0, 140))
-            self.screen.blit(bar, (0, self.screen_h - bar_h))
-
+        # Status bar.
+        if now < self.status_until or self.capture_busy:
+            self.screen.blit(self._status_bar, (0, self.screen_h - 30))
             text = self.status_text
             if self.capture_busy and not text.startswith("SAVING"):
                 text = "SAVING..."
             txt = self.font.render(text, True, (255, 255, 255))
-            self.screen.blit(txt, (10, self.screen_h - bar_h + 5))
+            self.screen.blit(txt, (10, self.screen_h - 25))
 
-        # white flash overlay when photo is taken
-        if time.time() < self.flash_until:
-            flash = pygame.Surface((self.screen_w, self.screen_h), pygame.SRCALPHA)
-            flash.fill((255, 255, 255, 130))
-            self.screen.blit(flash, (0, 0))
+        # Flash overlay.
+        if now < self.flash_until:
+            self.screen.blit(self._flash_surface, (0, 0))
 
     def _touch_to_xy(self, event):
         if event.type == pygame.FINGERDOWN:
             return int(event.x * self.screen_w), int(event.y * self.screen_h)
-        elif event.type == pygame.MOUSEBUTTONDOWN:
+        if event.type == pygame.MOUSEBUTTONDOWN:
             return event.pos
         return None
 
     def _apply_digicam_look(self, rgb_array):
+        """Post-process a captured frame to get the retro digicam aesthetic."""
         img = Image.fromarray(rgb_array)
 
         if PHOTO_ROTATE:
             img = img.rotate(PHOTO_ROTATE, expand=True)
 
-        # Old digicam feel: shrink then blow back up slightly.
-        if 0 < POST_DOWNSCALE < 1.0:
-            small_w = max(1, int(img.width * POST_DOWNSCALE))
-            small_h = max(1, int(img.height * POST_DOWNSCALE))
-            img = img.resize((small_w, small_h), RESAMPLE_BILINEAR)
-            img = img.resize((rgb_array.shape[1], rgb_array.shape[0]), RESAMPLE_BILINEAR)
+        w, h = img.size
 
-        # Tiny red-channel shift for imperfect optics vibe.
-        r, g, b = img.split()
-        r = ImageChops.offset(r, POST_RED_SHIFT_PX, 0)
-        img = Image.merge("RGB", (r, g, b))
+        # Downscale then upscale for that old-sensor look.
+        if 0 < POST_DOWNSCALE < 1.0:
+            small_w = max(1, int(w * POST_DOWNSCALE))
+            small_h = max(1, int(h * POST_DOWNSCALE))
+            img = img.resize((small_w, small_h), RESAMPLE_BILINEAR)
+            img = img.resize((w, h), RESAMPLE_BILINEAR)
+
+        # Chromatic misalignment: shift red channel.
+        if POST_RED_SHIFT_PX:
+            r, g, b = img.split()
+            r = ImageChops.offset(r, POST_RED_SHIFT_PX, 0)
+            img = Image.merge("RGB", (r, g, b))
 
         # Punchy compact-camera processing.
         img = ImageEnhance.Contrast(img).enhance(1.20)
         img = ImageEnhance.Color(img).enhance(1.10)
         img = ImageEnhance.Sharpness(img).enhance(1.45)
 
-        # Add some noise/grain.
-        arr = np.asarray(img).astype(np.int16)
-        noise = np.random.normal(0, POST_NOISE_STD, arr.shape).astype(np.int16)
-        arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-        img = Image.fromarray(arr)
+        # Add grain. Use uint8 math to halve memory vs int16 on full-res images.
+        if POST_NOISE_STD > 0:
+            arr = np.asarray(img)
+            noise = np.random.normal(0, POST_NOISE_STD, arr.shape)
+            noisy = np.clip(arr.astype(np.float32) + noise.astype(np.float32),
+                            0, 255).astype(np.uint8)
+            img = Image.fromarray(noisy)
+            del arr, noise, noisy
 
-        # Slight tiny blur after everything to stop it feeling too "modern crispy".
+        # Slight softness.
         if POST_BLUR_RADIUS > 0:
             img = img.filter(ImageFilter.GaussianBlur(radius=POST_BLUR_RADIUS))
 
         return img
 
     def _save_photo_worker(self, rgb_array, filename):
+        """Run in a background thread to avoid blocking the preview."""
         try:
             img = self._apply_digicam_look(rgb_array)
             img.save(
@@ -289,12 +321,12 @@ class DigicamApp:
 
         self.last_capture_time = now
         self.capture_busy = True
-        self.flash_until = time.time() + 0.10
+        self.flash_until = now + 0.10
         self._set_status("CAPTURING...", seconds=1.0)
 
         try:
-            # Switch to higher-res still mode, capture, then return to preview mode.
-            rgb = self.picam2.switch_mode_and_capture_array(self.still_config, "main")
+            # Grab from the main (high-res) stream - no mode switch needed.
+            rgb = self.picam2.capture_array("main")
         except Exception as e:
             self.capture_busy = False
             self._set_status(f"CAPTURE FAILED: {e}", seconds=4.0)
@@ -302,12 +334,12 @@ class DigicamApp:
 
         filename = OUTPUT_DIR / datetime.now().strftime("DIGI_%Y%m%d_%H%M%S_%f.jpg")
 
-        saver = threading.Thread(
+        thread = threading.Thread(
             target=self._save_photo_worker,
             args=(rgb, filename),
             daemon=True,
         )
-        saver.start()
+        thread.start()
 
     def handle_events(self):
         for event in pygame.event.get():
@@ -324,17 +356,16 @@ class DigicamApp:
 
             if event.type in (pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN):
                 pos = self._touch_to_xy(event)
-                if pos is not None:
-                    x, y = pos
-                    if self._point_in_shutter_zone(x, y):
-                        self.capture_photo()
+                if pos and self.shutter_rect.collidepoint(pos):
+                    self.capture_photo()
 
     def run(self):
         try:
             while self.running:
                 self.handle_events()
 
-                frame = self.picam2.capture_array("main")
+                # Read from lores stream for fast, low-memory preview.
+                frame = self.picam2.capture_array("lores")
                 preview_surface = self._build_preview_surface(frame)
 
                 self.screen.fill((0, 0, 0))
@@ -343,7 +374,6 @@ class DigicamApp:
 
                 pygame.display.flip()
                 self.clock.tick(PREVIEW_FPS)
-
         finally:
             try:
                 self.picam2.stop()
