@@ -12,10 +12,6 @@ import threading
 from pathlib import Path
 from datetime import datetime
 
-# SDL hints for RPi4 KMS/DRM - must be set before pygame import.
-os.environ.setdefault("SDL_VIDEODRIVER", "kmsdrm")
-os.environ.setdefault("SDL_VIDEO_EGL_DRIVER", "libEGL.so")
-
 import cv2
 import numpy as np
 import pygame
@@ -144,19 +140,26 @@ class DigicamApp:
 
         self.picam2, self.camera_has_af = init_camera()
 
-        # Initialize pygame.
-        pygame.init()
-        pygame.font.init()
+        # Initialize pygame with the best available video driver.
+        self.screen = None
+        for driver in ("kmsdrm", "x11", "directfb", "fbdev", "wayland", ""):
+            os.environ["SDL_VIDEODRIVER"] = driver
+            try:
+                pygame.display.quit()
+                pygame.display.init()
+                self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+                break
+            except pygame.error:
+                continue
 
-        # Try fullscreen; fall back to a window if KMS/DRM isn't available.
-        try:
-            self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-        except pygame.error:
-            # Fallback for X11 / Wayland / SSH-forwarded sessions.
-            os.environ["SDL_VIDEODRIVER"] = ""
+        if self.screen is None:
+            # Last resort: let SDL pick, windowed mode.
+            os.environ.pop("SDL_VIDEODRIVER", None)
             pygame.display.quit()
             pygame.display.init()
             self.screen = pygame.display.set_mode((480, 320))
+
+        pygame.font.init()
 
         pygame.display.set_caption("Pi Digicam")
         pygame.mouse.set_visible(False)
