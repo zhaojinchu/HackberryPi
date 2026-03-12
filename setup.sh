@@ -14,11 +14,12 @@ sudo apt install -y \
     python3-pygame \
     python3-pil \
     python3-numpy \
-    python3-libcamera
+    python3-libcamera \
+    python3-opencv
 
 # Create photo output directory.
 echo "[2/4] Creating photo directory..."
-mkdir -p "$HOME/digicam_photos"
+mkdir -p "$HOME/CreamPi"
 
 # Enable camera interface if not already enabled.
 echo "[3/4] Checking camera interface..."
@@ -59,4 +60,4 @@ echo "  To stop:       systemctl --user stop digicam"
 echo ""
 echo "=== Setup complete ==="
 echo "Run manually with: python3 ${SCRIPT_DIR}/digicam_touch.py"
-echo "Photos will be saved to: $HOME/digicam_photos/"
+echo "Photos will be saved to: $HOME/CreamPi/"

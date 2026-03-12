@@ -16,6 +16,7 @@ from datetime import datetime
 os.environ.setdefault("SDL_VIDEODRIVER", "kmsdrm")
 os.environ.setdefault("SDL_VIDEO_EGL_DRIVER", "libEGL.so")
 
+import cv2
 import numpy as np
 import pygame
 from PIL import Image, ImageEnhance, ImageChops, ImageFilter
@@ -61,7 +62,7 @@ POST_BLUR_RADIUS = 0.2
 CAPTURE_DEBOUNCE_SEC = 0.45
 
 # Where photos are saved.
-OUTPUT_DIR = Path.home() / "digicam_photos"
+OUTPUT_DIR = Path.home() / "CreamPi"
 
 # =========================
 # PIL resampling compat
@@ -94,7 +95,7 @@ def init_camera():
     # Both streams run simultaneously from the same ISP pipeline - no mode switch needed.
     config = picam2.create_preview_configuration(
         main={"size": STILL_SIZE, "format": "RGB888"},
-        lores={"size": PREVIEW_SIZE, "format": "RGB888"},
+        lores={"size": PREVIEW_SIZE, "format": "YUV420"},
         buffer_count=4,
         queue=False,
     )
@@ -198,9 +199,11 @@ class DigicamApp:
         self.status_until = time.time() + seconds
 
     def _build_preview_surface(self, frame):
-        """Convert camera lores frame (H,W,3) to a pygame surface."""
-        # np.transpose creates a contiguous copy - unavoidable for pygame's (W,H,3) layout.
-        surface = pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2)))
+        """Convert camera lores YUV420 frame to a pygame surface."""
+        # lores stream is YUV420: shape is (H*3//2, W) - convert to RGB.
+        rgb = cv2.cvtColor(frame, cv2.COLOR_YUV420p2RGB)
+        # pygame wants (W, H, 3) layout.
+        surface = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
         if PREVIEW_ROTATE:
             surface = pygame.transform.rotate(surface, PREVIEW_ROTATE)
         return surface
