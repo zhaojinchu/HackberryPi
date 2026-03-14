@@ -1,0 +1,11 @@
+# Camera app
+picamera2
+pygame
+Pillow
+numpy
+opencv-python
+RPi.GPIO
+
+# Web gallery
+flask
+watchdog

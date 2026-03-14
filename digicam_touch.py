@@ -4,6 +4,8 @@ Retro digicam app for Raspberry Pi 4 (1GB RAM).
 
 Uses picamera2 dual-stream: lores for live preview, main for high-res capture.
 No mode switching = fast capture, low memory, no freezes.
+
+Hardware button (GPIO26, active-low) and RGB LED (GPIO21/20/16) supported.
 """
 import os
 import sys
@@ -16,6 +18,12 @@ import cv2
 import numpy as np
 import pygame
 from PIL import Image, ImageEnhance, ImageChops, ImageFilter
+
+try:
+    import RPi.GPIO as GPIO
+    HAS_GPIO = True
+except ImportError:
+    HAS_GPIO = False
 
 # =========================
 # USER SETTINGS
@@ -61,12 +69,62 @@ CAPTURE_DEBOUNCE_SEC = 0.45
 OUTPUT_DIR = Path.home() / "CreamPi"
 
 # =========================
+# GPIO PINS
+# =========================
+PIN_BTN = 26       # Shutter button (active-low: COM→GND, NO→GPIO26)
+PIN_LED_R = 21     # RGB LED red
+PIN_LED_G = 20     # RGB LED green
+PIN_LED_B = 16     # RGB LED blue
+
+# =========================
 # PIL resampling compat
 # =========================
 try:
     RESAMPLE_BILINEAR = Image.Resampling.BILINEAR
 except AttributeError:
     RESAMPLE_BILINEAR = Image.BILINEAR
+
+
+# =========================
+# GPIO / LED helpers
+# =========================
+
+def init_gpio():
+    """Set up GPIO for button and RGB LED. Returns True if successful."""
+    if not HAS_GPIO:
+        print("WARNING: RPi.GPIO not available, button/LED disabled.")
+        return False
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(PIN_BTN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    for pin in (PIN_LED_R, PIN_LED_G, PIN_LED_B):
+        GPIO.setup(pin, GPIO.OUT)
+        GPIO.output(pin, GPIO.LOW)
+    return True
+
+
+def led_set(r, g, b):
+    """Set RGB LED. Each value is True/False (on/off)."""
+    if not HAS_GPIO:
+        return
+    GPIO.output(PIN_LED_R, GPIO.HIGH if r else GPIO.LOW)
+    GPIO.output(PIN_LED_G, GPIO.HIGH if g else GPIO.LOW)
+    GPIO.output(PIN_LED_B, GPIO.HIGH if b else GPIO.LOW)
+
+
+def led_off():
+    led_set(False, False, False)
+
+
+def led_blink(r, g, b, count=3, on_time=0.08, off_time=0.08):
+    """Blink the LED in a background thread (non-blocking)."""
+    def _blink():
+        for _ in range(count):
+            led_set(r, g, b)
+            time.sleep(on_time)
+            led_off()
+            time.sleep(off_time)
+    threading.Thread(target=_blink, daemon=True).start()
 
 
 def init_camera():
@@ -137,6 +195,10 @@ def init_camera():
 class DigicamApp:
     def __init__(self):
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.gpio_ok = init_gpio()
+        # Steady green = camera ready
+        led_set(False, True, False)
 
         self.picam2, self.camera_has_af = init_camera()
 
@@ -313,8 +375,14 @@ class DigicamApp:
                 optimize=False,
             )
             self._set_status(f"SAVED {filename.name}", seconds=2.5)
+            # Green blink = save success, then back to steady green.
+            led_blink(False, True, False, count=3, on_time=0.1, off_time=0.06)
+            time.sleep(0.05)
+            led_set(False, True, False)
         except Exception as e:
             self._set_status(f"SAVE FAILED: {e}", seconds=4.0)
+            # Red blink = save failed.
+            led_blink(True, False, False, count=4)
         finally:
             self.capture_busy = False
 
@@ -330,13 +398,21 @@ class DigicamApp:
         self.flash_until = now + 0.10
         self._set_status("CAPTURING...", seconds=1.0)
 
+        # White flash on LED while capturing.
+        led_set(True, True, True)
+
         try:
             # Grab from the main (high-res) stream - no mode switch needed.
             rgb = self.picam2.capture_array("main")
         except Exception as e:
             self.capture_busy = False
+            # Red blink = capture failed.
+            led_blink(True, False, False, count=4)
             self._set_status(f"CAPTURE FAILED: {e}", seconds=4.0)
             return
+
+        # Blue = saving to disk.
+        led_set(False, False, True)
 
         filename = OUTPUT_DIR / datetime.now().strftime("DIGI_%Y%m%d_%H%M%S_%f.jpg")
 
@@ -365,10 +441,18 @@ class DigicamApp:
                 if pos and self.shutter_rect.collidepoint(pos):
                     self.capture_photo()
 
+    def _poll_button(self):
+        """Check hardware shutter button (active-low)."""
+        if not self.gpio_ok:
+            return
+        if GPIO.input(PIN_BTN) == GPIO.LOW:
+            self.capture_photo()
+
     def run(self):
         try:
             while self.running:
                 self.handle_events()
+                self._poll_button()
 
                 # Read from lores stream for fast, low-memory preview.
                 frame = self.picam2.capture_array("lores")
@@ -381,6 +465,9 @@ class DigicamApp:
                 pygame.display.flip()
                 self.clock.tick(PREVIEW_FPS)
         finally:
+            led_off()
+            if HAS_GPIO:
+                GPIO.cleanup()
             try:
                 self.picam2.stop()
             except Exception:
